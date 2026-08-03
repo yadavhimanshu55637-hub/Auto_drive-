@@ -1,0 +1,9 @@
+setuptools>=68.0.0
+numpy>=1.26
+opencv-python>=4.7.0
+torch>=2.0.0
+ultralytics>=8.0.0
+streamlit>=1.30.0
+plotly>=5.20.0
+# Optional: enables DeepSORT multi-object tracking acceleration
+deep_sort_realtime>=1.3.0
