@@ -17,16 +17,10 @@ except ImportError:
     PLOTLY_AVAILABLE = False
 
 from collision import CollisionPredictor
+from detection import Detector
 from lane_detection import LaneDetector
 from traffic_sign import TrafficSignRecognizer
 from tracking import MultiObjectTracker
-
-Detector = None
-_detector_import_error = None
-try:
-    from detection import Detector
-except ImportError as exc:
-    _detector_import_error = exc
 
 
 @dataclass
@@ -39,12 +33,7 @@ class FrameMetrics:
 
 
 @st.cache_resource
-def load_detector(model_type: str, conf_threshold: float, iou_threshold: float):
-    if _detector_import_error is not None:
-        raise RuntimeError(
-            "Failed to import Detector. Install the required dependencies and try again. "
-            f"Original error: {_detector_import_error}"
-        )
+def load_detector(model_type: str, conf_threshold: float, iou_threshold: float) -> Detector:
     return Detector(model_type=model_type, conf_threshold=conf_threshold, iou_threshold=iou_threshold)
 
 
@@ -117,14 +106,19 @@ def annotate_frame(
     return annotated
 
 
-def compute_speed_estimate(tracks: List) -> float:
+from typing import Callable
+
+
+def compute_speed_estimate(tracks: List, fps: float = 20.0, meters_per_pixel: float = 0.04) -> float:
     if not tracks:
         return 0.0
     speeds = [np.linalg.norm(track.velocity) for track in tracks]
-    return float(np.mean(speeds) * 8.0)
+    average_pixels_per_frame = float(np.mean(speeds))
+    speed_m_s = average_pixels_per_frame * meters_per_pixel * fps
+    return float(speed_m_s * 3.6)
 
 
-def frame_analysis(frame: np.ndarray, detector: Detector, lane_detector: LaneDetector, sign_recognizer: TrafficSignRecognizer, tracker: MultiObjectTracker, collision_predictor: CollisionPredictor) -> Tuple[List, List, List, List, List[FrameMetrics], np.ndarray]:
+def frame_analysis(frame: np.ndarray, detector: Detector, lane_detector: LaneDetector, sign_recognizer: TrafficSignRecognizer, tracker: MultiObjectTracker, collision_predictor: CollisionPredictor) -> Tuple[List, List, List, List, List, FrameMetrics]:
     detections = detector.predict(frame)
     tracks = tracker.update(detections, frame=frame)
     lanes = lane_detector.detect(frame)
@@ -141,22 +135,33 @@ def frame_analysis(frame: np.ndarray, detector: Detector, lane_detector: LaneDet
     return detections, tracks, lanes, signs, alerts, metrics
 
 
-def run_video_analysis(
-    video_path: str,
+def get_video_writer(output_path: str, frame_size: Tuple[int, int], fps: float = 20.0):
+    fourcc = getattr(cv2, "VideoWriter_fourcc")(*"mp4v")
+    return cv2.VideoWriter(output_path, fourcc, fps, frame_size)
+
+
+def run_capture_analysis(
+    capture: cv2.VideoCapture,
     max_frames: int,
     detector: Detector,
     lane_detector: LaneDetector,
     sign_recognizer: TrafficSignRecognizer,
     tracker: MultiObjectTracker,
     collision_predictor: CollisionPredictor,
+    output_path: Optional[str] = None,
+    frame_callback: Optional[Callable[[np.ndarray, int], None]] = None,
 ) -> Tuple[List[FrameMetrics], np.ndarray]:
-    cap = cv2.VideoCapture(video_path)
+    tracker.reset()
     metrics: List[FrameMetrics] = []
     annotated_frame = None
     frame_index = 0
+    fps = float(capture.get(cv2.CAP_PROP_FPS) or 20.0)
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+    writer = get_video_writer(output_path, (width, height), fps) if output_path else None
 
-    while frame_index < max_frames and cap.isOpened():
-        ret, frame = cap.read()
+    while frame_index < max_frames and capture.isOpened():
+        ret, frame = capture.read()
         if not ret:
             break
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -165,7 +170,27 @@ def run_video_analysis(
         lanes = lane_detector.detect(frame)
         signs = sign_recognizer.detect(frame)
         alerts = collision_predictor.predict(tracks, image_shape=frame.shape)
-        speed = compute_speed_estimate(tracks)
+        speed = compute_speed_estimate(tracks, fps=fps)
+
+        annotated = annotate_frame(
+            frame,
+            detections,
+            tracks,
+            lanes,
+            signs,
+            alerts,
+            show_detection=True,
+            show_tracks=True,
+            show_lanes=True,
+            show_signs=True,
+            show_alerts=True,
+        )
+
+        if writer is not None and writer.isOpened():
+            writer.write(cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
+
+        if frame_callback is not None:
+            frame_callback(annotated, frame_index)
 
         metrics.append(
             FrameMetrics(
@@ -178,28 +203,47 @@ def run_video_analysis(
         )
 
         if frame_index == 0:
-            annotated_frame = annotate_frame(
-                frame,
-                detections,
-                tracks,
-                lanes,
-                signs,
-                alerts,
-                show_detection=True,
-                show_tracks=True,
-                show_lanes=True,
-                show_signs=True,
-                show_alerts=True,
-            )
+            annotated_frame = annotated
 
         frame_index += 1
 
-    cap.release()
-    return metrics, annotated_frame if annotated_frame is not None else np.zeros((480, 640, 3), dtype=np.uint8)
+    if writer is not None:
+        writer.release()
+    capture.release()
+
+    if annotated_frame is None:
+        annotated_frame = np.zeros((height, width, 3), dtype=np.uint8)
+
+    return metrics, annotated_frame
+
+
+def run_video_analysis(
+    video_path: str,
+    max_frames: int,
+    detector: Detector,
+    lane_detector: LaneDetector,
+    sign_recognizer: TrafficSignRecognizer,
+    tracker: MultiObjectTracker,
+    collision_predictor: CollisionPredictor,
+    output_path: Optional[str] = None,
+) -> Tuple[List[FrameMetrics], np.ndarray]:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return [], np.zeros((480, 640, 3), dtype=np.uint8)
+    return run_capture_analysis(
+        cap,
+        max_frames,
+        detector,
+        lane_detector,
+        sign_recognizer,
+        tracker,
+        collision_predictor,
+        output_path=output_path,
+    )
 
 
 def build_speedometer(speed_kmh: float):
-    if not PLOTLY_AVAILABLE:
+    if go is None:
         return None
 
     fig = go.Figure(
@@ -224,7 +268,7 @@ def build_speedometer(speed_kmh: float):
 
 
 def build_object_count_chart(frame_metrics: List[FrameMetrics]):
-    if not PLOTLY_AVAILABLE or not frame_metrics:
+    if go is None or not frame_metrics:
         return None
     x = [m.frame_index for m in frame_metrics]
     y = [m.object_count for m in frame_metrics]
@@ -234,7 +278,7 @@ def build_object_count_chart(frame_metrics: List[FrameMetrics]):
 
 
 def build_collision_timeline(frame_metrics: List[FrameMetrics]):
-    if not PLOTLY_AVAILABLE or not frame_metrics:
+    if go is None or not frame_metrics:
         return None
     x = [m.frame_index for m in frame_metrics]
     y = [m.collision_count for m in frame_metrics]
@@ -244,7 +288,7 @@ def build_collision_timeline(frame_metrics: List[FrameMetrics]):
 
 
 def build_class_distribution(frame_metrics: List[FrameMetrics]):
-    if not PLOTLY_AVAILABLE:
+    if go is None:
         return None
     counter = Counter()
     for metric in frame_metrics:
@@ -265,21 +309,14 @@ def main():
         "Use the dashboard to analyze video snapshots, uploaded footage, or camera captures with object detection, lane detection, sign recognition, tracking, and collision prediction."
     )
 
-    if _detector_import_error is not None:
-        st.error(
-            "The object detection backend could not be loaded because required dependencies are missing. "
-            "Install the dependencies from requirements.txt and restart the app."
-        )
-        st.code(str(_detector_import_error))
-        return
-
     with st.sidebar:
         st.header("Controls")
-        source = st.radio("Data source", ["Image", "Upload Video", "Camera Snapshot"])
+        source = st.radio("Data source", ["Image", "Upload Video", "Live Webcam"])
         model_type = st.selectbox("Detection model", ["yolov11", "rt-detr"])
         conf_threshold = st.slider("Confidence threshold", 0.1, 0.8, 0.35, 0.05)
         iou_threshold = st.slider("NMS IoU threshold", 0.1, 0.7, 0.45, 0.05)
-        max_frames = st.slider("Frames to analyze", 1, 40, 12)
+        max_frames = st.slider("Frames to analyze", 1, 80, 24)
+        save_output = st.checkbox("Save annotated output video", False)
         show_detection = st.checkbox("Show detections", True)
         show_tracks = st.checkbox("Show tracks", True)
         show_lanes = st.checkbox("Show lane overlay", True)
@@ -303,6 +340,9 @@ def main():
         if image_file is not None and analyze_button:
             image_bytes = np.asarray(bytearray(image_file.read()), dtype=np.uint8)
             frame = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
+            if frame is None:
+                st.error("The uploaded image could not be decoded.")
+                st.stop()
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             detections = detector.predict(frame)
             tracks = tracker.update(detections, frame=frame)
@@ -323,7 +363,7 @@ def main():
                 show_alerts,
             )
             final_metrics = [FrameMetrics(frame_index=0, detected_classes=Counter([det.label for det in detections]), object_count=len(detections), collision_count=len(alerts), average_speed=compute_speed_estimate(tracks))]
-            source_preview = st.image(annotated_frame, caption="Annotated image", use_column_width=True)
+            source_preview = st.image(annotated_frame, caption="Annotated image", width="stretch")
 
     elif source == "Upload Video":
         video_file = st.file_uploader("Upload a driving video", type=["mp4", "mov", "avi", "mkv"])
@@ -331,6 +371,7 @@ def main():
             temp_path = os.path.join(".", "temp_video.mp4")
             with open(temp_path, "wb") as f:
                 f.write(video_file.read())
+            output_path = os.path.join(".", "annotated_video.mp4") if save_output else None
             with st.spinner("Processing video frames..."):
                 final_metrics, annotated_frame = run_video_analysis(
                     temp_path,
@@ -340,36 +381,45 @@ def main():
                     sign_recognizer,
                     tracker,
                     collision_predictor,
+                    output_path=output_path,
                 )
-            source_preview = st.image(annotated_frame, caption="Annotated video key frame", use_column_width=True)
+            source_preview = st.image(annotated_frame, caption="Annotated video key frame", width="stretch")
+            if output_path and os.path.exists(output_path):
+                with open(output_path, "rb") as f:
+                    st.download_button("Download annotated video", f.read(), file_name="annotated_output.mp4")
+                os.remove(output_path)
             os.remove(temp_path)
 
     else:
-        camera_image = st.camera_input("Take a snapshot of the driving scene")
-        if camera_image is not None and analyze_button:
-            image_bytes = np.asarray(bytearray(camera_image.read()), dtype=np.uint8)
-            frame = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            detections = detector.predict(frame)
-            tracks = tracker.update(detections, frame=frame)
-            lanes = lane_detector.detect(frame)
-            signs = sign_recognizer.detect(frame)
-            alerts = collision_predictor.predict(tracks, image_shape=frame.shape)
-            annotated_frame = annotate_frame(
-                frame,
-                detections,
-                tracks,
-                lanes,
-                signs,
-                alerts,
-                show_detection,
-                show_tracks,
-                show_lanes,
-                show_signs,
-                show_alerts,
-            )
-            final_metrics = [FrameMetrics(frame_index=0, detected_classes=Counter([det.label for det in detections]), object_count=len(detections), collision_count=len(alerts), average_speed=compute_speed_estimate(tracks))]
-            source_preview = st.image(annotated_frame, caption="Annotated camera snapshot", use_column_width=True)
+        if analyze_button:
+            output_path = os.path.join(".", "webcam_annotated.mp4") if save_output else None
+            preview_slot = st.empty()
+            def live_frame_callback(frame: np.ndarray, frame_index: int):
+                preview_slot.image(frame, caption=f"Webcam frame {frame_index + 1}", width="stretch")
+
+            capture = cv2.VideoCapture(0)
+            if not capture.isOpened():
+                st.error("Unable to open the webcam. Make sure a camera is connected and accessible.")
+            else:
+                with st.spinner("Capturing live webcam frames..."):
+                    final_metrics, annotated_frame = run_capture_analysis(
+                        capture,
+                        max_frames,
+                        detector,
+                        lane_detector,
+                        sign_recognizer,
+                        tracker,
+                        collision_predictor,
+                        output_path=output_path,
+                        frame_callback=live_frame_callback,
+                    )
+                source_preview = st.image(annotated_frame, caption="Annotated webcam key frame", width="stretch")
+                if output_path and os.path.exists(output_path):
+                    with open(output_path, "rb") as f:
+                        st.download_button("Download webcam annotated video", f.read(), file_name="webcam_output.mp4")
+                    os.remove(output_path)
+        else:
+            st.info("Click Analyze now to capture a short live webcam sequence.")
 
     if final_metrics:
         totals = {"objects": sum(m.object_count for m in final_metrics), "collisions": sum(m.collision_count for m in final_metrics), "avg_speed": np.mean([m.average_speed for m in final_metrics])}
@@ -437,3 +487,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
